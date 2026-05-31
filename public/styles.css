@@ -1,0 +1,76 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html {
+  font-weight: 300;
+  -webkit-font-smoothing: antialiased;
+}
+
+html, input {
+  font-family:
+    "HelveticaNeue-Light",
+    "Helvetica Neue Light",
+    "Helvetica Neue",
+    Helvetica,
+    Arial,
+    "Lucida Grande",
+    sans-serif;
+}
+
+ul {
+  list-style: none;
+  word-wrap: break-word;
+}
+
+
+body {
+  height: 100%;
+  padding: 0;
+  background-color: #143F6B;
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.piano {
+  display: flex;
+  margin-left: -150px;
+  margin-right: 100px;
+}
+
+.key {
+  height: calc(var(--width) * 4);
+  width: var(--width);
+}
+
+.white {
+  --width: 100px;
+  background-color: white;
+  border: 1px solid #333;
+}
+
+.white.active {
+  background-color: #CCC;
+}
+
+.white.deactive {
+  background-color: white;
+}
+
+.black {
+  --width: 60px;
+  background-color: black;
+  margin-left: calc(var(--width) / -2);
+  margin-right: calc(var(--width) / -2);
+  z-index: 2;
+}
+
+.black.active {
+  background-color: #333;
+}
+
+
+

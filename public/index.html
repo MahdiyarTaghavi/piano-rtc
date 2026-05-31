@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PianoRTC</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <!-- ── Video feeds ───────────────────────────────────────────────────── -->
+  <div id="videoContainer">
+    <video id="localVideo"  autoplay muted  playsinline></video>
+    <video id="remoteVideo" autoplay        playsinline></video>
+  </div>
+
+  <!-- ── Piano keyboard ───────────────────────────────────────────────── -->
+  <div class="piano">
+    <div data-note="C"  class="key white"></div>
+    <div data-note="Db" class="key black"></div>
+    <div data-note="D"  class="key white"></div>
+    <div data-note="Eb" class="key black"></div>
+    <div data-note="E"  class="key white"></div>
+    <div data-note="F"  class="key white"></div>
+    <div data-note="Gb" class="key black"></div>
+    <div data-note="G"  class="key white"></div>
+    <div data-note="Ab" class="key black"></div>
+    <div data-note="A"  class="key white"></div>
+    <div data-note="Bb" class="key black"></div>
+    <div data-note="B"  class="key white"></div>
+  </div>
+
+  <!-- ── Audio samples (hidden, preloaded) ────────────────────────────── -->
+  <audio id="C"  preload="auto" src="/notes/C.mp3"></audio>
+  <audio id="Db" preload="auto" src="/notes/Db.mp3"></audio>
+  <audio id="D"  preload="auto" src="/notes/D.mp3"></audio>
+  <audio id="Eb" preload="auto" src="/notes/Eb.mp3"></audio>
+  <audio id="E"  preload="auto" src="/notes/E.mp3"></audio>
+  <audio id="F"  preload="auto" src="/notes/F.mp3"></audio>
+  <audio id="Gb" preload="auto" src="/notes/Gb.mp3"></audio>
+  <audio id="G"  preload="auto" src="/notes/G.mp3"></audio>
+  <audio id="Ab" preload="auto" src="/notes/Ab.mp3"></audio>
+  <audio id="A"  preload="auto" src="/notes/A.mp3"></audio>
+  <audio id="Bb" preload="auto" src="/notes/Bb.mp3"></audio>
+  <audio id="B"  preload="auto" src="/notes/B.mp3"></audio>
+
+  <!-- ── Scripts ──────────────────────────────────────────────────────── -->
+  <!--
+    Load order matters:
+      1. socket.io-client  – provided by the server at /socket.io/socket.io.js
+      2. Our classes       – PianoController and WebRTCClient export to global scope
+      3. app.js            – entry point that uses both classes
+  -->
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/js/WebRTCClient.js"></script>
+  <script src="/js/PianoController.js"></script>
+  <script src="/js/app.js"></script>
+
+</body>
+</html>
