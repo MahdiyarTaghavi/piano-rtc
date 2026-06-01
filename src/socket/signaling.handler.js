@@ -3,82 +3,82 @@
 /**
  * SignalingHandler
  *
- * Encapsulates all Socket.IO event handling for:
- *  - WebRTC peer signaling  (join, relayICECandidate, relaySessionDescription)
- *  - Piano synchronisation  (keydown, keyup  →  receiveKeyDown, receiveKeyUp)
+ * Encapsulates all Socket.IO event handling for WebRTC peer signaling only:
+ *  - join              → peer discovery and addPeer broadcast
+ *  - relayICECandidate → ICE candidate relay between peers
+ *  - relaySessionDescription → SDP offer/answer relay between peers
  *
- * Design patterns used:
- *  - **Facade**: one class hides the complexity of channel management and
- *    peer-to-peer relaying behind a clean `attach(io)` interface.
- *  - **Observer**: socket events are the observable; handler methods are the
- *    observers — registered in one place, easy to extend or test individually.
+ * Piano key events are intentionally absent here. They used to be relayed
+ * through this server (keydown → receiveKeyDown), but are now sent directly
+ * between browsers via RTCDataChannel. The server has no role in note
+ * delivery after the initial handshake — which is architecturally correct:
+ * the server should not be in the data path for real-time user interaction.
  *
- * Keeping this class separate from server.js respects the
- * Single Responsibility Principle: the server bootstraps infrastructure,
- * this class owns the real-time communication protocol.
+ * Design patterns:
+ *  - **Facade**: one class hides channel management and peer relay behind a
+ *    single attach(io) call.
+ *  - **Observer**: Socket.IO events are the observable; private handler methods
+ *    are the observers — each registered once in _onConnection, easy to extend.
+ *  - **Single Responsibility**: this class owns the signaling protocol only.
+ *    server.js owns infrastructure. Config owns constants.
  */
 class SignalingHandler {
   constructor() {
     /**
      * channels: { [channelName]: { [socketId]: Socket } }
-     * Tracks which sockets are in which channel so we can broadcast
-     * addPeer events to the right peers only.
+     * Tracks membership so addPeer events reach only the right peers.
      */
     this.channels = {};
 
     /**
      * sockets: { [socketId]: Socket }
-     * A flat registry so we can look up any socket by id when relaying
-     * ICE candidates or session descriptions.
+     * Flat registry for direct peer-to-peer relay lookups.
      */
     this.sockets = {};
   }
 
   /**
-   * Attach all event listeners to the Socket.IO server instance.
-   * Call this once after the server is ready.
+   * Attach all Socket.IO listeners to the server instance.
+   * Call once during server bootstrap.
    *
    * @param {import('socket.io').Server} io
    */
   attach(io) {
     this._io = io;
-
-    io.on('connection', (socket) => {
-      this._onConnection(socket);
-    });
+    io.on('connection', (socket) => this._onConnection(socket));
   }
 
-  // Private: connection lifecycle
+  // ─── Private: connection lifecycle ────────────────────────────────────────
 
   _onConnection(socket) {
     socket.channels = {};
     this.sockets[socket.id] = socket;
     console.log(`[${socket.id}] connected`);
 
-    socket.on('join',                  (cfg)         => this._onJoin(socket, cfg));
-    socket.on('relayICECandidate',     (cfg)         => this._onRelayICE(socket, cfg));
-    socket.on('relaySessionDescription',(cfg)        => this._onRelaySessionDescription(socket, cfg));
-    socket.on('keydown',               (white, black) => this._onKeyDown(socket, white, black));
-    socket.on('keyup',                 (white, black) => this._onKeyUp(socket, white, black));
-    socket.on('disconnect',            ()            => this._onDisconnect(socket));
+    socket.on('join',                    (cfg) => this._onJoin(socket, cfg));
+    socket.on('relayICECandidate',       (cfg) => this._onRelayICE(socket, cfg));
+    socket.on('relaySessionDescription', (cfg) => this._onRelaySessionDescription(socket, cfg));
+    socket.on('disconnect',              ()    => this._onDisconnect(socket));
+
+    // Note: no keydown / keyup handlers — those are now peer-to-peer via
+    // RTCDataChannel and never reach this server.
   }
 
   _onDisconnect(socket) {
     console.log(`[${socket.id}] disconnected`);
-
-    // Remove from every channel this socket was part of
     for (const channel of Object.keys(socket.channels)) {
       delete this.channels[channel]?.[socket.id];
     }
-
     delete this.sockets[socket.id];
   }
 
-  // Private: WebRTC signaling
+  // ─── Private: WebRTC signaling ─────────────────────────────────────────────
 
   /**
-   * A peer joins a channel. We tell every existing peer to add the newcomer,
-   * and tell the newcomer to add every existing peer (with offer duty).
+   * A new peer wants to join a channel.
+   * We tell every existing peer to add the newcomer (no offer duty),
+   * and tell the newcomer to add each existing peer (with offer duty).
+   * The offer-duty peer is also responsible for creating the DataChannel.
    */
   _onJoin(socket, { channel, userdata }) {
     console.log(`[${socket.id}] joining channel "${channel}"`, userdata);
@@ -90,15 +90,15 @@ class SignalingHandler {
 
     this.channels[channel] ??= {};
 
-    // Notify existing peers → they add the newcomer (no offer)
-    // Notify newcomer       → it adds each existing peer (with offer)
     for (const peerId of Object.keys(this.channels[channel])) {
+      // Existing peer: you will receive the newcomer's offer
       this.channels[channel][peerId].emit('addPeer', {
-        peer_id: socket.id,
+        peer_id:             socket.id,
         should_create_offer: false,
       });
+      // Newcomer: create the offer (and the DataChannel) for each existing peer
       socket.emit('addPeer', {
-        peer_id: peerId,
+        peer_id:             peerId,
         should_create_offer: true,
       });
     }
@@ -107,38 +107,22 @@ class SignalingHandler {
     socket.channels[channel] = channel;
   }
 
-  /** Relay an ICE candidate from one peer to another. */
+  /** Relay an ICE candidate from one peer to its target. */
   _onRelayICE(socket, { peer_id, ice_candidate }) {
     console.log(`[${socket.id}] relaying ICE → [${peer_id}]`);
     this.sockets[peer_id]?.emit('iceCandidate', {
-      peer_id: socket.id,
+      peer_id:       socket.id,
       ice_candidate,
     });
   }
 
-  /** Relay an SDP offer or answer from one peer to another. */
+  /** Relay an SDP offer or answer from one peer to its target. */
   _onRelaySessionDescription(socket, { peer_id, session_description }) {
     console.log(`[${socket.id}] relaying SDP → [${peer_id}]`);
     this.sockets[peer_id]?.emit('sessionDescription', {
-      peer_id: socket.id,
+      peer_id:             socket.id,
       session_description,
     });
-  }
-
-  // Private: piano synchronisation
-
-  /**
-   * A key was pressed. Broadcast to ALL connected clients (including sender)
-   * so the UI stays in sync across tabs/devices.
-   */
-  _onKeyDown(socket, whiteKeyIndex, blackKeyIndex) {
-    console.log(`[${socket.id}] keydown white=${whiteKeyIndex} black=${blackKeyIndex}`);
-    this._io.emit('receiveKeyDown', { whiteKeyIndex, blackKeyIndex });
-  }
-
-  _onKeyUp(socket, whiteKeyIndex, blackKeyIndex) {
-    console.log(`[${socket.id}] keyup white=${whiteKeyIndex} black=${blackKeyIndex}`);
-    this._io.emit('receiveKeyUp', { whiteKeyIndex, blackKeyIndex });
   }
 }
 

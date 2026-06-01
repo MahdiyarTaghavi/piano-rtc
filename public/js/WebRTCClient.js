@@ -9,20 +9,34 @@
  *  - Creating and tearing down RTCPeerConnections per remote peer
  *  - Relaying ICE candidates and SDP offers/answers through the signaling server
  *  - Attaching remote media streams to the UI
+ *  - Opening a RTCDataChannel for low-latency peer-to-peer data (piano notes)
  *
  * Design patterns:
- *  - **Facade**: hides the complexity of RTCPeerConnection management and
- *    Socket.IO signaling behind a two-method public API: `init()` and `join()`.
+ *  - **Facade**: hides RTCPeerConnection + DataChannel complexity behind a
+ *    minimal public API: init(), join(), sendData(), and the onData callback.
  *  - **Dependency Injection**: receives the signaling socket rather than
  *    creating it internally, keeping the class testable and decoupled.
+ *  - **Observer**: onData is a settable callback — callers register interest
+ *    without this class knowing anything about piano keys.
+ *
+ * DataChannel notes (for the portfolio explanation):
+ *  RTCDataChannel is a peer-to-peer channel riding the same DTLS/SCTP
+ *  transport as the media tracks. Messages travel directly between browsers —
+ *  the signaling server is NOT involved after the initial handshake.
+ *  This makes it strictly lower latency than the previous socket-relay approach
+ *  and removes the server as a bottleneck for note events.
+ *
+ *  Only the *offer* side creates the channel (createDataChannel).
+ *  The *answer* side receives it through the ondatachannel event.
+ *  Both sides end up with a symmetric RTCDataChannel object.
  */
 class WebRTCClient {
   /**
-   * @param {object}   options
-   * @param {import('socket.io-client').Socket} options.socket      - shared signaling socket
-   * @param {HTMLVideoElement}                  options.localVideo  - <video> for own camera
-   * @param {HTMLVideoElement}                  options.remoteVideo - <video> for peer camera
-   * @param {RTCIceServer[]}                   [options.iceServers] - STUN/TURN config
+   * @param {object}          options
+   * @param {Socket}          options.socket      - shared Socket.IO signaling socket
+   * @param {HTMLVideoElement} options.localVideo  - <video> for own camera feed
+   * @param {HTMLVideoElement} options.remoteVideo - <video> for peer camera feed
+   * @param {RTCIceServer[]}  [options.iceServers] - STUN / TURN server config
    */
   constructor({ socket, localVideo, remoteVideo, iceServers = [] }) {
     this._socket      = socket;
@@ -35,14 +49,33 @@ class WebRTCClient {
 
     /**
      * Peer registry: { [peerId]: RTCPeerConnection }
-     * One RTCPeerConnection per remote peer.
+     * One RTCPeerConnection per remote peer (supports future multi-peer).
      */
     this._peers = {};
+
+    /**
+     * DataChannel registry: { [peerId]: RTCDataChannel }
+     * Mirrors _peers — one channel per connection.
+     */
+    this._dataChannels = {};
+
+    /**
+     * onData — set this from outside to receive incoming data messages.
+     * Called with the parsed message object whenever any peer sends data.
+     *
+     * @example
+     *   rtcClient.onData = (msg) => piano.handleRemoteMessage(msg);
+     *
+     * @type {((msg: object) => void) | null}
+     */
+    this.onData = null;
   }
 
+  // ─── Public API ────────────────────────────────────────────────────────────
+
   /**
-   * Request local media and register signaling socket listeners.
-   * Must be called once before `join()`.
+   * Acquire local media and register all socket signaling listeners.
+   * Must be called once before join().
    *
    * @returns {Promise<void>}
    */
@@ -52,29 +85,42 @@ class WebRTCClient {
   }
 
   /**
-   * Join a named channel on the signaling server.
-   * Other peers in the channel will be notified to connect.
+   * Join a named signaling channel. The server will notify other peers,
+   * triggering the addPeer → offer/answer → ICE handshake sequence.
    *
-   * @param {string} channel   - channel name (matches server config default)
-   * @param {object} [userdata] - arbitrary metadata sent to server
+   * @param {string} channel    - must match the channel name used by other peers
+   * @param {object} [userdata] - optional metadata forwarded to the server
    */
   join(channel, userdata = {}) {
     this._socket.emit('join', { channel, userdata });
   }
 
-  // Private: local media
+  /**
+   * Send arbitrary data to all connected peers via their DataChannels.
+   * No-ops silently if no channel is open yet (e.g. before a peer joins).
+   *
+   * @param {object} message - will be JSON-serialised before sending
+   */
+  sendData(message) {
+    const payload = JSON.stringify(message);
+    for (const [peerId, dc] of Object.entries(this._dataChannels)) {
+      if (dc.readyState === 'open') {
+        dc.send(payload);
+      } else {
+        console.warn(`[DataChannel][${peerId}] not open (state: ${dc.readyState}), message dropped`);
+      }
+    }
+  }
+
+  // ─── Private: local media ──────────────────────────────────────────────────
 
   async _setupLocalMedia() {
-    if (this._localStream) return; // already acquired
+    if (this._localStream) return; // idempotent
 
     try {
       this._localStream = await navigator.mediaDevices.getUserMedia({
         audio: true,
-        video: {
-          width:  { ideal: 1280 },
-          height: { ideal: 720 },
-          facingMode: 'user',
-        },
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
       });
       this._localVideo.srcObject = this._localStream;
     } catch (err) {
@@ -83,30 +129,31 @@ class WebRTCClient {
     }
   }
 
-  // Private: signaling event binding
+  // ─── Private: signaling event binding ─────────────────────────────────────
 
   _bindSignalingEvents() {
-    this._socket.on('addPeer',            (cfg) => this._onAddPeer(cfg));
-    this._socket.on('sessionDescription', (cfg) => this._onSessionDescription(cfg));
-    this._socket.on('iceCandidate',       (cfg) => this._onIceCandidate(cfg));
+    this._socket.on('addPeer',             (cfg) => this._onAddPeer(cfg));
+    this._socket.on('sessionDescription',  (cfg) => this._onSessionDescription(cfg));
+    this._socket.on('iceCandidate',        (cfg) => this._onIceCandidate(cfg));
   }
 
-  // Private: WebRTC signaling handlers
+  // ─── Private: WebRTC peer lifecycle ───────────────────────────────────────
 
   /**
-   * Server instructs us to open a connection with a new peer.
-   * If `should_create_offer` is true, we are responsible for initiating.
+   * Server says: "a new peer exists, connect to them."
+   * The peer with should_create_offer=true is responsible for the SDP offer
+   * AND for creating the DataChannel (offer side always creates it).
    */
   async _onAddPeer({ peer_id, should_create_offer }) {
     if (this._peers[peer_id]) {
-      console.warn(`Already connected to peer ${peer_id}`);
+      console.warn(`[WebRTC] Already connected to peer ${peer_id}`);
       return;
     }
 
     const pc = new RTCPeerConnection({ iceServers: this._iceServers });
     this._peers[peer_id] = pc;
 
-    // Forward ICE candidates to the signaling server for relay
+    // Trickle ICE: forward candidates to the signaling server as they arrive
     pc.onicecandidate = ({ candidate }) => {
       if (candidate) {
         this._socket.emit('relayICECandidate', {
@@ -119,12 +166,12 @@ class WebRTCClient {
       }
     };
 
-    // When remote tracks arrive, attach them to the remote video element
+    // Remote media tracks → attach to the video element
     pc.ontrack = ({ streams }) => {
       this._remoteVideo.srcObject = streams[0];
     };
 
-    // Add local tracks to the connection
+    // Add local tracks so the peer gets our audio/video
     if (this._localStream) {
       this._localStream.getTracks().forEach((track) => {
         pc.addTrack(track, this._localStream);
@@ -132,8 +179,47 @@ class WebRTCClient {
     }
 
     if (should_create_offer) {
+      // Offer side: create the DataChannel BEFORE creating the offer.
+      // The channel negotiation is embedded in the SDP, so the answer
+      // side will receive it via ondatachannel automatically.
+      this._setupDataChannel(peer_id, pc.createDataChannel('piano'));
       await this._createAndSendOffer(peer_id, pc);
+    } else {
+      // Answer side: wait for the offer side to open the channel
+      pc.ondatachannel = ({ channel }) => {
+        this._setupDataChannel(peer_id, channel);
+      };
     }
+  }
+
+  /**
+   * Attach the standard event listeners to a DataChannel regardless of
+   * which side created it. Kept separate so both code paths share the logic.
+   *
+   * @param {string}          peerId
+   * @param {RTCDataChannel}  dc
+   */
+  _setupDataChannel(peerId, dc) {
+    this._dataChannels[peerId] = dc;
+
+    dc.onopen  = () => console.log(`[DataChannel][${peerId}] open`);
+    dc.onclose = () => {
+      console.log(`[DataChannel][${peerId}] closed`);
+      delete this._dataChannels[peerId];
+    };
+    dc.onerror = (err) => console.error(`[DataChannel][${peerId}] error`, err);
+
+    dc.onmessage = ({ data }) => {
+      try {
+        const msg = JSON.parse(data);
+        // Deliver to whoever registered interest (e.g. PianoController)
+        if (typeof this.onData === 'function') {
+          this.onData(msg);
+        }
+      } catch (err) {
+        console.error('[DataChannel] failed to parse message:', data, err);
+      }
+    };
   }
 
   async _createAndSendOffer(peerId, pc) {
@@ -145,7 +231,7 @@ class WebRTCClient {
         session_description: offer,
       });
     } catch (err) {
-      console.error('Error creating offer:', err);
+      console.error('[WebRTC] Error creating offer:', err);
     }
   }
 
@@ -156,7 +242,6 @@ class WebRTCClient {
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(session_description));
 
-      // If we received an offer, respond with an answer
       if (session_description.type === 'offer') {
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
@@ -166,7 +251,7 @@ class WebRTCClient {
         });
       }
     } catch (err) {
-      console.error('Error handling session description:', err);
+      console.error('[WebRTC] Error handling session description:', err);
     }
   }
 
